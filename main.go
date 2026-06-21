@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
@@ -11,7 +12,6 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"html"
 	"strings"
 	"time"
 
@@ -21,15 +21,15 @@ import (
 )
 
 type config struct {
-	intervalSec    int
-	memAlertPct    float64
-	cpuAlertPct    float64
-	topN           int
-	cooldownMin    int
-	logDir         string
-	retentionDays  int
-	tgBotToken     string
-	tgChatID       string
+	intervalSec   int
+	memAlertPct   float64
+	cpuAlertPct   float64
+	topN          int
+	cooldownMin   int
+	logDir        string
+	retentionDays int
+	tgBotToken    string
+	tgChatID      string
 }
 
 type procSnapshot struct {
@@ -45,12 +45,11 @@ type procSnapshot struct {
 }
 
 type procResult struct {
-	snap    procSnapshot
-	cpuPct  float64
+	snap   procSnapshot
+	cpuPct float64
 }
 
 func loadConfig() config {
-	// Load shared env first, then local override
 	_ = godotenv.Load("../.env")
 	_ = godotenv.Load(".env")
 
@@ -84,10 +83,28 @@ func loadConfig() config {
 		topN:          getInt("TOP_N", 10),
 		cooldownMin:   getInt("ALERT_COOLDOWN_MIN", 15),
 		logDir:        getStr("LOG_DIR", "./logs"),
-		retentionDays: getInt("LOG_RETENTION_DAYS", 1),
+		retentionDays: getInt("LOG_RETENTION_DAYS", 2),
 		tgBotToken:    os.Getenv("DEVELOPER_TELEGRAM_BOT_TOKEN"),
 		tgChatID:      os.Getenv("DEVELOPER_TELEGRAM_CHAT_ID"),
 	}
+}
+
+// openDailyLog opens (or reopens on date rollover) the daily log file and
+// redirects the log package output to it. Returns the new file and today's date string.
+func openDailyLog(logDir, currentDate string) (*os.File, string) {
+	today := time.Now().Format("2006-01-02")
+	if today == currentDate {
+		return nil, currentDate
+	}
+	path := filepath.Join(logDir, "monitor-"+today+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot open log file %s: %v\n", path, err)
+		return nil, currentDate
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.Ldate | log.Ltime)
+	return f, today
 }
 
 func snapshotProcs() map[int32]procSnapshot {
@@ -106,8 +123,7 @@ func snapshotProcs() map[int32]procSnapshot {
 		}
 		cmdline, _ := p.Cmdline()
 		times, _ := p.Times()
-		cpu := 0.0
-		sys := 0.0
+		cpu, sys := 0.0, 0.0
 		if times != nil {
 			cpu = times.User
 			sys = times.System
@@ -123,7 +139,6 @@ func snapshotProcs() map[int32]procSnapshot {
 			cmdline: cmdline,
 		}
 	}
-	// Fill parent names
 	for pid, snap := range snaps {
 		if parent, ok := snaps[snap.ppid]; ok {
 			snap.parentName = parent.name
@@ -139,7 +154,7 @@ func diffProcs(before, after map[int32]procSnapshot, wallSec float64) []procResu
 	for pid, a := range after {
 		b, ok := before[pid]
 		if !ok {
-			b = a // new process, can't diff
+			b = a
 		}
 		deltaCPU := (a.cpuUser - b.cpuUser) + (a.cpuSys - b.cpuSys)
 		cpuPct := 0.0
@@ -204,7 +219,7 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func compactHeartbeat(vm *mem.VirtualMemoryStat, totalCPU float64, topMem []procResult) string {
+func compactLine(vm *mem.VirtualMemoryStat, totalCPU float64, topMem []procResult) string {
 	usedGB := float64(vm.Used) / 1024 / 1024 / 1024
 	totalGB := float64(vm.Total) / 1024 / 1024 / 1024
 	ts := time.Now().Format("15:04:05")
@@ -217,7 +232,7 @@ func compactHeartbeat(vm *mem.VirtualMemoryStat, totalCPU float64, topMem []proc
 		ts, vm.UsedPercent, usedGB, totalGB, totalCPU, top)
 }
 
-func writeLog(path, content string) {
+func appendLog(path, content string) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Printf("log write error: %v", err)
@@ -274,40 +289,25 @@ func pruneOldLogs(logDir string, retentionDays int) {
 	}
 }
 
-func totalCPUPercent() float64 {
-	// Sample two-point delta over 1s for total CPU
-	procs1 := snapshotProcs()
-	time.Sleep(1 * time.Second)
-	procs2 := snapshotProcs()
-
-	var totalBefore, totalAfter float64
-	for pid, a := range procs2 {
-		totalAfter += a.cpuUser + a.cpuSys
-		if b, ok := procs1[pid]; ok {
-			totalBefore += b.cpuUser + b.cpuSys
-		}
-	}
-	numCPU := float64(runtime.NumCPU())
-	delta := totalAfter - totalBefore
-	if delta < 0 || numCPU == 0 {
-		return 0
-	}
-	pct := (delta / 1.0 / numCPU) * 100
-	if pct > 100*numCPU {
-		pct = 100
-	}
-	return pct
-}
-
 func main() {
 	cfg := loadConfig()
 
 	if err := os.MkdirAll(cfg.logDir, 0755); err != nil {
-		log.Fatalf("cannot create log dir %s: %v", cfg.logDir, err)
+		fmt.Fprintf(os.Stderr, "cannot create log dir %s: %v\n", cfg.logDir, err)
+		os.Exit(1)
 	}
 
-	log.Printf("monitor started | interval=%ds mem_alert=%.0f%% cpu_alert=%.0f%% top=%d cooldown=%dmin",
-		cfg.intervalSec, cfg.memAlertPct, cfg.cpuAlertPct, cfg.topN, cfg.cooldownMin)
+	// Open today's log file and redirect log package to it.
+	// PM2 only captures fmt.Println (stdout) — the compact heartbeat line.
+	var logFile *os.File
+	var currentDate string
+	logFile, currentDate = openDailyLog(cfg.logDir, "")
+	if logFile != nil {
+		defer logFile.Close()
+	}
+
+	log.Printf("monitor started | interval=%ds mem_alert=%.0f%% cpu_alert=%.0f%% top=%d cooldown=%dmin retention=%dd",
+		cfg.intervalSec, cfg.memAlertPct, cfg.cpuAlertPct, cfg.topN, cfg.cooldownMin, cfg.retentionDays)
 
 	pruneOldLogs(cfg.logDir, cfg.retentionDays)
 	lastPrune := time.Now()
@@ -315,6 +315,15 @@ func main() {
 
 	for {
 		tickStart := time.Now()
+
+		// Reopen log file on date rollover
+		if newFile, newDate := openDailyLog(cfg.logDir, currentDate); newFile != nil {
+			if logFile != nil {
+				logFile.Close()
+			}
+			logFile = newFile
+			currentDate = newDate
+		}
 
 		// --- 1. Snapshot procs (two-sample for CPU delta) ---
 		before := snapshotProcs()
@@ -345,10 +354,10 @@ func main() {
 		byMem := topByMem(procs, cfg.topN)
 		byCPU := topByCPU(procs, cfg.topN)
 
-		// --- 4. Compact stdout heartbeat ---
-		fmt.Println(compactHeartbeat(vm, totalCPU, byMem))
+		// --- 4. Compact heartbeat → stdout (PM2 captures this, tiny) ---
+		fmt.Println(compactLine(vm, totalCPU, byMem))
 
-		// --- 5. Daily log ---
+		// --- 5. Full tables → daily log file (managed by us, not PM2) ---
 		logPath := filepath.Join(cfg.logDir, "monitor-"+time.Now().Format("2006-01-02")+".log")
 		swapLine := ""
 		if swap != nil {
@@ -356,12 +365,8 @@ func main() {
 				swap.UsedPercent, float64(swap.Used)/1024/1024, float64(swap.Total)/1024/1024)
 		}
 		header := fmt.Sprintf("\n[%s] RAM=%.1f%% CPU=%.1f%% | %s\n",
-			time.Now().Format("2006-01-02 15:04:05"),
-			vm.UsedPercent, totalCPU, swapLine)
-		tableContent := header +
-			formatTable(byCPU, "TOP CPU", false) + "\n" +
-			formatTable(byMem, "TOP MEM", false) + "\n"
-		writeLog(logPath, tableContent)
+			time.Now().Format("2006-01-02 15:04:05"), vm.UsedPercent, totalCPU, swapLine)
+		appendLog(logPath, header+formatTable(byCPU, "TOP CPU", false)+"\n"+formatTable(byMem, "TOP MEM", false)+"\n")
 
 		// --- 6. Alert ---
 		memBreached := vm.UsedPercent >= cfg.memAlertPct
@@ -393,9 +398,9 @@ func main() {
 			alertContent += fmt.Sprintf("CPUs: %d | Total load: %.1f%%\n\n", runtime.NumCPU(), totalCPU)
 			alertContent += formatTable(byCPU, "TOP CPU", true) + "\n"
 			alertContent += formatTable(byMem, "TOP MEM", true) + "\n"
-			writeLog(alertPath, alertContent)
+			appendLog(alertPath, alertContent)
+			log.Printf("alert written: %s", alertPath)
 
-			// Telegram message: top 5 by mem
 			top5 := byMem
 			if len(top5) > 5 {
 				top5 = top5[:5]
@@ -411,9 +416,8 @@ func main() {
 					"• <code>%s</code> (pid %d ← %s) | %s | CPU %.1f%%",
 					html.EscapeString(s.name), s.pid, html.EscapeString(s.parentName), fmtMB(s.rss), r.cpuPct))
 			}
-			tgMsg := strings.Join(tgLines, "\n")
 
-			if err := sendTelegram(cfg.tgBotToken, cfg.tgChatID, tgMsg); err != nil {
+			if err := sendTelegram(cfg.tgBotToken, cfg.tgChatID, strings.Join(tgLines, "\n")); err != nil {
 				log.Printf("telegram: %v", err)
 			} else {
 				log.Printf("telegram alert sent: %s", reason)
@@ -426,10 +430,8 @@ func main() {
 			lastPrune = time.Now()
 		}
 
-		// Sleep remainder of interval (already spent ~1s on CPU sampling)
 		elapsed := time.Since(tickStart)
-		remaining := time.Duration(cfg.intervalSec)*time.Second - elapsed
-		if remaining > 0 {
+		if remaining := time.Duration(cfg.intervalSec)*time.Second - elapsed; remaining > 0 {
 			time.Sleep(remaining)
 		}
 	}

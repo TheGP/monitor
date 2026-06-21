@@ -48,7 +48,7 @@ if pm2 describe "$PM2_APP_NAME" > /dev/null 2>&1; then
     echo "Reloaded"
 else
     echo "Starting $PM2_APP_NAME..."
-    pm2 start "./$BINARY_NAME" --name "$PM2_APP_NAME"
+    pm2 start "./$BINARY_NAME" --name "$PM2_APP_NAME" --error /dev/null
     echo "Started"
 fi
 

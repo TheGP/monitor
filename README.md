@@ -1,6 +1,15 @@
 # monitor
 
-PM2-managed process watchdog. Runs every minute, logs top CPU/RAM consumers with parent process info, and sends a Telegram alert when memory or CPU crosses a threshold.
+PM2-managed process watchdog. Every minute logs top CPU/RAM consumers with parent process info, and sends a Telegram alert when memory or CPU crosses a threshold.
+
+## Logging
+
+- **PM2 stdout** (`pm2 logs monitor`) — one compact line per tick only:
+  `12:03 RAM 72% 5.6/8G | CPU 34% | top: node 800MB(pid 1234←pm2)`
+- **`logs/monitor-YYYY-MM-DD.log`** — full tables per tick (top CPU + top RAM with parent/user/cmd)
+- **`logs/alert-<timestamp>.log`** — full dump with cmdlines on every threshold breach
+
+All logs are written and rotated by the app itself. No pm2-logrotate needed.
 
 ## Deploy (server)
 
@@ -9,17 +18,10 @@ cd ~/apps/monitor
 bash deploy.sh
 ```
 
-First time only — cap PM2 log rotation:
-```bash
-pm2 install pm2-logrotate
-pm2 set pm2-logrotate:max_size 10M
-pm2 set pm2-logrotate:retain 2
-```
-
 ## Credentials
 
-Telegram creds are read from `../.env` (shared apps folder) or local `.env`.  
-Required keys: `DEVELOPER_TELEGRAM_BOT_TOKEN`, `DEVELOPER_TELEGRAM_CHAT_ID`.
+Reads from `../.env` first (shared apps folder), then local `.env`.
+Required: `DEVELOPER_TELEGRAM_BOT_TOKEN`, `DEVELOPER_TELEGRAM_CHAT_ID`.
 
 ## Config (`.env`)
 
@@ -31,19 +33,13 @@ Required keys: `DEVELOPER_TELEGRAM_BOT_TOKEN`, `DEVELOPER_TELEGRAM_CHAT_ID`.
 | `TOP_N` | `10` | Processes to show per table |
 | `ALERT_COOLDOWN_MIN` | `15` | Min minutes between alerts |
 | `LOG_DIR` | `./logs` | Where to write log files |
-| `LOG_RETENTION_DAYS` | `1` | Delete logs older than N days |
-
-## Logs
-
-- **PM2 stdout** (`pm2 logs monitor`) — one compact line per tick: `12:03 RAM 72% 5.6/8G | CPU 34% | top: node 800MB(pid 1234←pm2)`
-- **`logs/monitor-YYYY-MM-DD.log`** — full table per tick (top CPU + top RAM with parent info)
-- **`logs/alert-<timestamp>.log`** — full dump with cmdlines on every threshold breach
+| `LOG_RETENTION_DAYS` | `2` | Delete logs older than N days |
 
 ## Useful commands
 
 ```bash
-pm2 logs monitor          # live heartbeat
-pm2 status                # check it's running
-tail -f logs/monitor-$(date +%F).log   # today's full tables
-ls -lt logs/alert-*.log | head         # recent alerts
+pm2 logs monitor                              # live compact heartbeat
+pm2 status                                    # check it's running
+tail -f logs/monitor-$(date +%F).log          # today's full tables
+ls -lt logs/alert-*.log | head                # recent alerts
 ```

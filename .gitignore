@@ -2,3 +2,4 @@ logs/
 monitor
 monitor.exe
 .env
+.gocache
